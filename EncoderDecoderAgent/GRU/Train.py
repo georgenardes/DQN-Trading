@@ -59,20 +59,20 @@ class Train(BaseTrain):
                                     window_size)
         self.hidden_size = hidden_size
 
-        self.encoder = EncoderRNN(self.data_train.state_size, self.hidden_size, device).to(device)
-        self.attention = AttentionLayer(self.hidden_size, self.window_size, device).to(device)
-        self.policy_decoder = Decoder(self.hidden_size).to(device)
-        self.target_decoder = Decoder(self.hidden_size).to(device)
+        self.encoder = EncoderRNN(self.data_train.state_size, self.hidden_size, self.device).to(self.device)
+        self.attention = AttentionLayer(self.hidden_size, self.window_size, self.device).to(self.device)
+        self.policy_decoder = Decoder(self.hidden_size).to(self.device)
+        self.target_decoder = Decoder(self.hidden_size).to(self.device)
 
-        self.policy_net = Seq2Seq(self.encoder, self.attention, self.policy_decoder).to(device)
-        self.target_net = Seq2Seq(self.encoder, self.attention, self.target_decoder).to(device)
+        self.policy_net = Seq2Seq(self.encoder, self.attention, self.policy_decoder).to(self.device)
+        self.target_net = Seq2Seq(self.encoder, self.attention, self.target_decoder).to(self.device)
 
         self.optimizer = optim.Adam(self.policy_net.parameters())
         self.target_decoder.load_state_dict(self.policy_decoder.state_dict())
         self.target_decoder.eval()
 
-        test_encoder = EncoderRNN(self.data_train.state_size, self.hidden_size, device).to(device)
-        test_attention = AttentionLayer(self.hidden_size, self.window_size, device).to(device)
-        test_decoder = Decoder(self.hidden_size).to(device)
+        test_encoder = EncoderRNN(self.data_train.state_size, self.hidden_size, self.device).to(self.device)
+        test_attention = AttentionLayer(self.hidden_size, self.window_size, self.device).to(self.device)
+        test_decoder = Decoder(self.hidden_size).to(self.device)
 
         self.test_net = Seq2Seq(test_encoder, test_attention, test_decoder)

@@ -1,0 +1,54 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python environment folders
+venv/
+env/
+.venv/
+
+# VS Code
+.vscode/
+
+# PyTorch / model checkpoints
+*.pth
+*.pt
+
+# Logs
+*.log
+
+# Notebook checkpoints
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
+
+# Temporary files / packaging
+pip-wheel-metadata/
+*.egg-info/
+
+# Test cache
+.pytest_cache/
+
+# Common data/output files produced by training/backtests
+results/
+docs/
+configs/
+backtest_results.csv
+best_account_*.csv
+train_account.csv
+best_performance_*.csv
+Data/
+Figures/
+Results/
+
+# Visualizations
+*.html
+
+# Local env files
+.env
+
+# Compiled extensions
+*.so
+

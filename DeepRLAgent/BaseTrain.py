@@ -55,6 +55,7 @@ class BaseTrain:
         """
         self.data_train = data_train
         self.data_test = data_test
+        self.device = getattr(self.data_train, 'device', device)
         self.DATASET_NAME = dataset_name
         self.BATCH_SIZE = BATCH_SIZE
         self.GAMMA = GAMMA
@@ -118,7 +119,7 @@ class BaseTrain:
                 self.policy_net.train()
                 return action
         else:
-            return torch.tensor([[random.randrange(3)]], device=device, dtype=torch.long)
+            return torch.tensor([[random.randrange(3)]], device=self.device, dtype=torch.long)
 
     def optimize_model(self):
         if len(self.memory) < self.BATCH_SIZE:
@@ -132,7 +133,7 @@ class BaseTrain:
         # Compute a mask of non-final states and concatenate the batch elements
         # (a final state would've been the one after which simulation ended)
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-                                                batch.next_state)), device=device, dtype=torch.bool)
+                            batch.next_state)), device=self.device, dtype=torch.bool)
         non_final_next_states = torch.cat([s for s in batch.next_state
                                            if s is not None])
 
@@ -152,7 +153,7 @@ class BaseTrain:
         # on the "older" target_net; selecting their best reward with max(1)[0].
         # This is merged based on the mask, such that we'll have either the expected
         # state value or 0 in case the state was final.
-        next_state_values = torch.zeros(self.BATCH_SIZE, device=device)
+        next_state_values = torch.zeros(self.BATCH_SIZE, device=self.device)
         next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].detach()
         # Compute the expected Q values
         expected_state_action_values = (next_state_values * (self.GAMMA ** self.n_step)) + reward_batch
@@ -172,23 +173,23 @@ class BaseTrain:
         for i_episode in tqdm(range(num_episodes)):
             # Initialize the environment and state
             self.data_train.reset()
-            state = torch.tensor([self.data_train.get_current_state()], dtype=torch.float, device=device)
+            state = torch.tensor([self.data_train.get_current_state()], dtype=torch.float, device=self.device)
             for t in count():
                 # Select and perform an action
                 action = self.select_action(state)
                 done, reward, next_state = self.data_train.step(action.item())
 
-                reward = torch.tensor([reward], dtype=torch.float, device=device)
+                reward = torch.tensor([reward], dtype=torch.float, device=self.device)
 
                 if next_state is not None:
-                    next_state = torch.tensor([next_state], dtype=torch.float, device=device)
+                    next_state = torch.tensor([next_state], dtype=torch.float, device=self.device)
 
                 # Store the transition in memory
                 self.memory.push(state, action, next_state, reward)
 
                 # Move to the next state
                 if not done:
-                    state = torch.tensor([self.data_train.get_current_state()], dtype=torch.float, device=device)
+                    state = torch.tensor([self.data_train.get_current_state()], dtype=torch.float, device=self.device)
 
                 # Perform one step of the optimization (on the target network)
                 self.optimize_model()
@@ -213,8 +214,8 @@ class BaseTrain:
         """
         data = self.data_train if test_type == 'train' else self.data_test
 
-        self.test_net.load_state_dict(torch.load(self.model_dir))
-        self.test_net.to(device)
+        self.test_net.load_state_dict(torch.load(self.model_dir, map_location=self.device))
+        self.test_net.to(self.device)
 
         action_list = []
         data.__iter__()

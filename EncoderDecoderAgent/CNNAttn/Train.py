@@ -61,16 +61,16 @@ class Train(BaseTrain):
         self.policy_decoder = Decoder(attn_output_size)
         self.target_decoder = Decoder(attn_output_size)
 
-        self.policy_net = Seq2Seq(self.encoder, self.attention, self.policy_decoder).to(device)
-        self.target_net = Seq2Seq(self.encoder, self.attention, self.target_decoder).to(device)
+        self.policy_net = Seq2Seq(self.encoder, self.attention, self.policy_decoder).to(self.device)
+        self.target_net = Seq2Seq(self.encoder, self.attention, self.target_decoder).to(self.device)
 
         self.target_decoder.load_state_dict(self.policy_decoder.state_dict())
         self.target_decoder.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters())
 
-        test_encoder = Encoder(self.data_train.state_size).to(device)
-        test_attn = AttentionLayer(self.window_size, attn_output_size).to(device)
-        test_decoder = Decoder(attn_output_size).to(device)
+        test_encoder = Encoder(self.data_train.state_size).to(self.device)
+        test_attn = AttentionLayer(self.window_size, attn_output_size).to(self.device)
+        test_decoder = Decoder(attn_output_size).to(self.device)
 
         self.test_net = Seq2Seq(test_encoder, test_attn, test_decoder)

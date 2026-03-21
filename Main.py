@@ -1,3 +1,9 @@
+import sys
+import os
+
+if '--cuda' not in sys.argv:
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
 # Importing DataLoaders for each model. These models include rule-based, vanilla DQN and encoder-decoder DQN.
 from DataLoader.DataLoader import YahooFinanceDataLoader
 from DataLoader.DataForPatternBasedAgent import DataForPatternBasedAgent
@@ -18,22 +24,136 @@ from DeepRLAgent.VanillaInput.Train import Train as DeepRL
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+
 import torch
 import argparse
 from tqdm import tqdm
-import os
+import math
 from utils import save_pkl, load_pkl
 
 parser = argparse.ArgumentParser(description='DQN-Trader arguments')
 parser.add_argument('--dataset-name', default="BTC-USD",
                     help='Name of the data inside the Data folder')
+parser.add_argument('--market', default='single', choices=['single', 'chinese', 'brazilian', 'custom'],
+                    help='Dataset selection mode')
+parser.add_argument('--symbols', default='',
+                    help='Comma-separated symbols when --market custom (or to override preset baskets)')
 parser.add_argument('--nep', type=int, default=30,
                     help='Number of episodes')
-parser.add_argument('--window_size', type=int, default=3,
+parser.add_argument('--window_size', type=int, default=20,
                     help='Window size for sequential models')
+parser.add_argument('--start-date', default='2012-01-01',
+                    help='Start date for market runs')
+parser.add_argument('--split-date', default='2024-01-01',
+                    help='Train/test split date for market runs')
+parser.add_argument('--end-date', default='2025-03-31',
+                    help='End date for market runs')
+parser.add_argument('--methods', default='DQN-vanilla,GRU,CNN-GRU,CNN-ATTN',
+                    help='Comma-separated method names for market runs')
 parser.add_argument('--cuda', action="store_true",
                     help='run on CUDA (default: False)')
 args = parser.parse_args()
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, '..'))
+DATASETS_DIR = os.path.join(BASE_DIR, 'Data')
+
+CHINESE_SYMBOLS = ['000063', '002008', '002352', '300015', '600030', '600036', '600900', '601899']
+BRAZILIAN_SYMBOLS = ['PETR4', 'CMIG4', 'VALE3', 'TOTS3', 'ITUB4', 'MOTV3', 'RADL3']
+
+
+def ensure_directory(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def resolve_symbols(market, symbols_arg):
+    if symbols_arg.strip():
+        return [s.strip() for s in symbols_arg.split(',') if s.strip()]
+    if market == 'chinese':
+        return CHINESE_SYMBOLS
+    if market == 'brazilian':
+        return BRAZILIAN_SYMBOLS
+    return []
+
+
+def prepare_dataset_csv(symbol, market, start_date, end_date):
+    source = os.path.join(ROOT_DIR, 'Data', market, f'{symbol}.csv')
+    if not os.path.exists(source):
+        raise FileNotFoundError(f'Missing source csv for {symbol}: {source}')
+
+    df = pd.read_csv(source)
+    date_column = 'Date' if 'Date' in df.columns else ('Timestamp' if 'Timestamp' in df.columns else None)
+    if date_column is None:
+        raise ValueError(f'{symbol}: expected Date or Timestamp column in {source}')
+
+    rename_map = {}
+    if date_column != 'Date':
+        rename_map[date_column] = 'Date'
+    if 'Close' not in df.columns and 'close' in df.columns:
+        rename_map['close'] = 'Close'
+    if 'Open' not in df.columns and 'open' in df.columns:
+        rename_map['open'] = 'Open'
+    if 'High' not in df.columns and 'high' in df.columns:
+        rename_map['high'] = 'High'
+    if 'Low' not in df.columns and 'low' in df.columns:
+        rename_map['low'] = 'Low'
+    if 'Volume' not in df.columns and 'volume' in df.columns:
+        rename_map['volume'] = 'Volume'
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+
+    required_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f'{symbol}: missing required columns {missing} in {source}')
+
+    prepared = df[required_cols].copy()
+    prepared['Date'] = pd.to_datetime(prepared['Date'])
+    prepared = prepared[(prepared['Date'] >= pd.Timestamp(start_date)) & (prepared['Date'] <= pd.Timestamp(end_date))]
+    prepared.sort_values('Date', inplace=True)
+    prepared['Adj Close'] = prepared['Close']
+    prepared = prepared[['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']]
+
+    target_dir = ensure_directory(os.path.join(DATASETS_DIR, symbol))
+    target_file = os.path.join(target_dir, f'{symbol}.csv')
+    processed_file = os.path.join(target_dir, 'data_processed.csv')
+    prepared.to_csv(target_file, index=False)
+
+    if os.path.exists(processed_file):
+        os.remove(processed_file)
+
+
+def compute_metrics(portfolio_values):
+    series = pd.Series(portfolio_values, dtype=float).dropna()
+    if len(series) < 2:
+        return {
+            'annualized_return_pct': float('nan'),
+            'sharpe_ratio': float('nan'),
+            'max_drawdown_pct': float('nan'),
+            'total_return_pct': float('nan'),
+            'final_portfolio_value': float(series.iloc[-1]) if len(series) > 0 else float('nan'),
+            'test_days': int(len(series))
+        }
+
+    returns = series.pct_change().dropna()
+    total_return = (series.iloc[-1] / series.iloc[0] - 1.0) * 100.0
+    annualized_return = ((series.iloc[-1] / series.iloc[0]) ** (252.0 / max(len(returns), 1)) - 1.0) * 100.0
+    sharpe = float('nan')
+    if returns.std(ddof=0) > 0:
+        sharpe = math.sqrt(252.0) * returns.mean() / returns.std(ddof=0)
+
+    drawdown = (series / series.cummax()) - 1.0
+    max_dd = drawdown.min() * 100.0
+
+    return {
+        'annualized_return_pct': float(annualized_return),
+        'sharpe_ratio': float(sharpe),
+        'max_drawdown_pct': float(abs(max_dd)),
+        'total_return_pct': float(total_return),
+        'final_portfolio_value': float(series.iloc[-1]),
+        'test_days': int(len(series))
+    }
 
 DATA_LOADERS = {
     'BTC-USD': YahooFinanceDataLoader('BTC-USD',
@@ -97,7 +217,12 @@ class SensitivityRun:
                  window_size,
                  device,
                  evaluation_parameter='gamma',
-                 transaction_cost=0):
+                 transaction_cost=0,
+                 begin_date=None,
+                 split_point='2018-01-01',
+                 end_date=None,
+                 load_from_file=True,
+                 selected_methods=None):
         """
 
         @param data_loader:
@@ -115,7 +240,15 @@ class SensitivityRun:
             or 'replay memory size'
         @param transaction_cost:
         """
-        self.data_loader = DATA_LOADERS[dataset_name]
+        self.data_loader = DATA_LOADERS[dataset_name] if (
+            dataset_name in DATA_LOADERS and begin_date is None and split_point == '2018-01-01' and end_date is None and load_from_file
+        ) else YahooFinanceDataLoader(
+            dataset_name,
+            split_point=split_point,
+            begin_date=begin_date,
+            end_date=end_date,
+            load_from_file=load_from_file
+        )
         self.dataset_name = dataset_name
         self.gamma = gamma
         self.batch_size = batch_size
@@ -127,6 +260,7 @@ class SensitivityRun:
         self.transaction_cost = transaction_cost
         self.window_size = window_size
         self.device = device
+        self.selected_methods = set(selected_methods) if selected_methods else None
         self.evaluation_parameter = evaluation_parameter
         # The state mode is only for autoPatternExtractionAgent. Therefore, for pattern inputs, the state mode would be
         # set to None, because it can be recovered from the name of the data loader (e.g. dataTrain_patternBased).
@@ -282,6 +416,209 @@ class SensitivityRun:
                                                   self.transaction_cost)
 
     def load_agents(self):
+        if self.selected_methods is not None:
+            if 'DQN-pattern' in self.selected_methods:
+                self.dqn_pattern = DeepRL(self.data_loader,
+                                          self.dataTrain_patternBased,
+                                          self.dataTest_patternBased,
+                                          self.dataset_name,
+                                          None,
+                                          self.window_size,
+                                          self.transaction_cost,
+                                          BATCH_SIZE=self.batch_size,
+                                          GAMMA=self.gamma,
+                                          ReplayMemorySize=self.replay_memory_size,
+                                          TARGET_UPDATE=self.target_update,
+                                          n_step=self.n_step)
+
+            if 'DQN-vanilla' in self.selected_methods:
+                self.dqn_vanilla = DeepRL(self.data_loader,
+                                          self.dataTrain_autoPatternExtractionAgent,
+                                          self.dataTest_autoPatternExtractionAgent,
+                                          self.dataset_name,
+                                          self.STATE_MODE_OHLC,
+                                          self.window_size,
+                                          self.transaction_cost,
+                                          BATCH_SIZE=self.batch_size,
+                                          GAMMA=self.gamma,
+                                          ReplayMemorySize=self.replay_memory_size,
+                                          TARGET_UPDATE=self.target_update,
+                                          n_step=self.n_step)
+
+            if 'DQN-candlerep' in self.selected_methods:
+                self.dqn_candle_rep = DeepRL(self.data_loader,
+                                             self.dataTrain_autoPatternExtractionAgent_candle_rep,
+                                             self.dataTest_autoPatternExtractionAgent_candle_rep,
+                                             self.dataset_name,
+                                             self.STATE_MODE_CANDLE_REP,
+                                             self.window_size,
+                                             self.transaction_cost,
+                                             BATCH_SIZE=self.batch_size,
+                                             GAMMA=self.gamma,
+                                             ReplayMemorySize=self.replay_memory_size,
+                                             TARGET_UPDATE=self.target_update,
+                                             n_step=self.n_step)
+
+            if 'DQN-windowed' in self.selected_methods:
+                self.dqn_windowed = DeepRL(self.data_loader,
+                                           self.dataTrain_autoPatternExtractionAgent_windowed,
+                                           self.dataTest_autoPatternExtractionAgent_windowed,
+                                           self.dataset_name,
+                                           self.STATE_MODE_WINDOWED,
+                                           self.window_size,
+                                           self.transaction_cost,
+                                           BATCH_SIZE=self.batch_size,
+                                           GAMMA=self.gamma,
+                                           ReplayMemorySize=self.replay_memory_size,
+                                           TARGET_UPDATE=self.target_update,
+                                           n_step=self.n_step)
+
+            if 'MLP-pattern' in self.selected_methods:
+                self.mlp_pattern = SimpleMLP(self.data_loader,
+                                             self.dataTrain_patternBased,
+                                             self.dataTest_patternBased,
+                                             self.dataset_name,
+                                             None,
+                                             self.window_size,
+                                             self.transaction_cost,
+                                             self.feature_size,
+                                             BATCH_SIZE=self.batch_size,
+                                             GAMMA=self.gamma,
+                                             ReplayMemorySize=self.replay_memory_size,
+                                             TARGET_UPDATE=self.target_update,
+                                             n_step=self.n_step)
+
+            if 'MLP-vanilla' in self.selected_methods:
+                self.mlp_vanilla = SimpleMLP(self.data_loader,
+                                             self.dataTrain_autoPatternExtractionAgent,
+                                             self.dataTest_autoPatternExtractionAgent,
+                                             self.dataset_name,
+                                             self.STATE_MODE_OHLC,
+                                             self.window_size,
+                                             self.transaction_cost,
+                                             self.feature_size,
+                                             BATCH_SIZE=self.batch_size,
+                                             GAMMA=self.gamma,
+                                             ReplayMemorySize=self.replay_memory_size,
+                                             TARGET_UPDATE=self.target_update,
+                                             n_step=self.n_step)
+
+            if 'MLP-candlerep' in self.selected_methods:
+                self.mlp_candle_rep = SimpleMLP(self.data_loader,
+                                                self.dataTrain_autoPatternExtractionAgent_candle_rep,
+                                                self.dataTest_autoPatternExtractionAgent_candle_rep,
+                                                self.dataset_name,
+                                                self.STATE_MODE_CANDLE_REP,
+                                                self.window_size,
+                                                self.transaction_cost,
+                                                self.feature_size,
+                                                BATCH_SIZE=self.batch_size,
+                                                GAMMA=self.gamma,
+                                                ReplayMemorySize=self.replay_memory_size,
+                                                TARGET_UPDATE=self.target_update,
+                                                n_step=self.n_step)
+
+            if 'MLP-windowed' in self.selected_methods:
+                self.mlp_windowed = SimpleMLP(self.data_loader,
+                                              self.dataTrain_autoPatternExtractionAgent_windowed,
+                                              self.dataTest_autoPatternExtractionAgent_windowed,
+                                              self.dataset_name,
+                                              self.STATE_MODE_WINDOWED,
+                                              self.window_size,
+                                              self.transaction_cost,
+                                              self.feature_size,
+                                              BATCH_SIZE=self.batch_size,
+                                              GAMMA=self.gamma,
+                                              ReplayMemorySize=self.replay_memory_size,
+                                              TARGET_UPDATE=self.target_update,
+                                              n_step=self.n_step)
+
+            if 'CNN1d' in self.selected_methods:
+                self.cnn1d = SimpleCNN(self.data_loader,
+                                       self.dataTrain_autoPatternExtractionAgent,
+                                       self.dataTest_autoPatternExtractionAgent,
+                                       self.dataset_name,
+                                       self.STATE_MODE_OHLC,
+                                       self.window_size,
+                                       self.transaction_cost,
+                                       self.feature_size,
+                                       BATCH_SIZE=self.batch_size,
+                                       GAMMA=self.gamma,
+                                       ReplayMemorySize=self.replay_memory_size,
+                                       TARGET_UPDATE=self.target_update,
+                                       n_step=self.n_step)
+
+            if 'CNN2d' in self.selected_methods:
+                self.cnn2d = CNN2d(self.data_loader,
+                                   self.dataTrain_sequential,
+                                   self.dataTest_sequential,
+                                   self.dataset_name,
+                                   self.feature_size,
+                                   self.transaction_cost,
+                                   BATCH_SIZE=self.batch_size,
+                                   GAMMA=self.gamma,
+                                   ReplayMemorySize=self.replay_memory_size,
+                                   TARGET_UPDATE=self.target_update,
+                                   n_step=self.n_step,
+                                   window_size=self.window_size)
+
+            if 'GRU' in self.selected_methods:
+                self.gru = GRU(self.data_loader,
+                               self.dataTrain_sequential,
+                               self.dataTest_sequential,
+                               self.dataset_name,
+                               self.transaction_cost,
+                               self.feature_size,
+                               BATCH_SIZE=self.batch_size,
+                               GAMMA=self.gamma,
+                               ReplayMemorySize=self.replay_memory_size,
+                               TARGET_UPDATE=self.target_update,
+                               n_step=self.n_step,
+                               window_size=self.window_size)
+
+            if 'Deep-CNN' in self.selected_methods:
+                self.deep_cnn = CNN(self.data_loader,
+                                    self.dataTrain_sequential,
+                                    self.dataTest_sequential,
+                                    self.dataset_name,
+                                    self.transaction_cost,
+                                    BATCH_SIZE=self.batch_size,
+                                    GAMMA=self.gamma,
+                                    ReplayMemorySize=self.replay_memory_size,
+                                    TARGET_UPDATE=self.target_update,
+                                    n_step=self.n_step,
+                                    window_size=self.window_size)
+
+            if 'CNN-GRU' in self.selected_methods:
+                self.cnn_gru = CNN_GRU(self.data_loader,
+                                       self.dataTrain_sequential,
+                                       self.dataTest_sequential,
+                                       self.dataset_name,
+                                       self.transaction_cost,
+                                       self.feature_size,
+                                       BATCH_SIZE=self.batch_size,
+                                       GAMMA=self.gamma,
+                                       ReplayMemorySize=self.replay_memory_size,
+                                       TARGET_UPDATE=self.target_update,
+                                       n_step=self.n_step,
+                                       window_size=self.window_size)
+
+            if 'CNN-ATTN' in self.selected_methods:
+                self.cnn_attn = CNN_ATTN(self.data_loader,
+                                         self.dataTrain_sequential,
+                                         self.dataTest_sequential,
+                                         self.dataset_name,
+                                         self.transaction_cost,
+                                         self.feature_size,
+                                         BATCH_SIZE=self.batch_size,
+                                         GAMMA=self.gamma,
+                                         ReplayMemorySize=self.replay_memory_size,
+                                         TARGET_UPDATE=self.target_update,
+                                         n_step=self.n_step,
+                                         window_size=self.window_size)
+
+            return
+
         self.dqn_pattern = DeepRL(self.data_loader,
                                   self.dataTrain_patternBased,
                                   self.dataTest_patternBased,
@@ -550,8 +887,141 @@ class SensitivityRun:
         self.plot_and_save_sensitivity()
         self.save_portfolios()
 
+    def get_method_agent(self, method_name):
+        mapping = {
+            'DQN-pattern': self.dqn_pattern,
+            'DQN-vanilla': self.dqn_vanilla,
+            'DQN-candlerep': self.dqn_candle_rep,
+            'DQN-windowed': self.dqn_windowed,
+            'MLP-pattern': self.mlp_pattern,
+            'MLP-vanilla': self.mlp_vanilla,
+            'MLP-candlerep': self.mlp_candle_rep,
+            'MLP-windowed': self.mlp_windowed,
+            'CNN1d': self.cnn1d,
+            'CNN2d': self.cnn2d,
+            'GRU': self.gru,
+            'Deep-CNN': self.deep_cnn,
+            'CNN-GRU': self.cnn_gru,
+            'CNN-ATTN': self.cnn_attn,
+        }
+        if method_name not in mapping:
+            raise ValueError(f'Unknown method: {method_name}')
+        return mapping[method_name]
 
-if __name__ == '__main__':
+    def train_selected(self, methods):
+        for method_name in methods:
+            self.get_method_agent(method_name).train(self.n_episodes)
+
+    def evaluate_selected(self, methods):
+        rows = []
+        for method_name in methods:
+            try:
+                evaluation = self.get_method_agent(method_name).test()
+                portfolio = evaluation.get_daily_portfolio_value()
+                metrics = compute_metrics(portfolio)
+                rows.append({
+                    'dataset': self.dataset_name,
+                    'method': method_name,
+                    'window_size': self.window_size,
+                    'status': 'ok',
+                    'error': '',
+                    **metrics,
+                })
+
+                out_dir = ensure_directory(os.path.join(BASE_DIR, 'Results', 'market_runs', self.evaluation_parameter, 'portfolios'))
+                dates = self.data_loader.data_test_with_date.index
+                diff = len(portfolio) - len(dates)
+                aligned = portfolio[diff:] if diff >= 0 else portfolio
+                min_len = min(len(aligned), len(dates))
+                pd.DataFrame({
+                    'date': dates[:min_len],
+                    'portfolio': aligned[:min_len],
+                }).to_csv(os.path.join(out_dir, f'{self.dataset_name}_{method_name}.csv'), index=False)
+            except Exception as exc:
+                rows.append({
+                    'dataset': self.dataset_name,
+                    'method': method_name,
+                    'window_size': self.window_size,
+                    'status': 'error',
+                    'error': str(exc),
+                    'annualized_return_pct': float('nan'),
+                    'sharpe_ratio': float('nan'),
+                    'max_drawdown_pct': float('nan'),
+                    'total_return_pct': float('nan'),
+                    'final_portfolio_value': float('nan'),
+                    'test_days': 0,
+                })
+
+        return rows
+
+
+def run_market_experiment():
+    symbols = resolve_symbols(args.market, args.symbols)
+    if args.market == 'single':
+        if not args.dataset_name:
+            raise ValueError('Provide --dataset-name for --market single')
+        symbols = [args.dataset_name]
+    if not symbols:
+        raise ValueError('No symbols resolved. Use --market chinese|brazilian or provide --symbols.')
+
+    methods = [m.strip() for m in args.methods.split(',') if m.strip()]
+    n_step = 8
+    n_episodes = args.nep
+    window_size = args.window_size
+    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
+    feature_size = 64
+    target_update = 5
+    gamma_default = 0.9
+    batch_size_default = 16
+    replay_memory_size_default = 32
+
+    scope = args.market if args.market != 'single' else 'single'
+    results_dir = ensure_directory(os.path.join(BASE_DIR, 'Results', 'market_runs', scope))
+    all_rows = []
+
+    for symbol in tqdm(symbols, desc=f'Running {scope} symbols'):
+        if args.market in ('chinese', 'brazilian'):
+            prepare_dataset_csv(symbol, args.market, args.start_date, args.end_date)
+
+        run = SensitivityRun(
+            symbol,
+            gamma_default,
+            batch_size_default,
+            replay_memory_size_default,
+            feature_size,
+            target_update,
+            n_episodes,
+            n_step,
+            window_size,
+            device,
+            evaluation_parameter=scope,
+            transaction_cost=0,
+            begin_date=args.start_date,
+            split_point=args.split_date,
+            end_date=args.end_date,
+            load_from_file=False,
+            selected_methods=methods,
+        )
+
+        for method_name in methods:
+            try:
+                run.get_method_agent(method_name).train(n_episodes)
+            except Exception as exc:
+                print(f'[WARN] Training failed for {symbol} / {method_name}: {exc}')
+
+        symbol_rows = run.evaluate_selected(methods)
+        all_rows.extend(symbol_rows)
+        pd.DataFrame(symbol_rows).to_csv(os.path.join(results_dir, f'{symbol}_metrics.csv'), index=False)
+
+    if all_rows:
+        df = pd.DataFrame(all_rows)
+        all_file = os.path.join(results_dir, 'all_metrics.csv')
+        summary_file = os.path.join(results_dir, 'summary_avg.csv')
+        df.to_csv(all_file, index=False)
+        df.groupby('method')[['annualized_return_pct', 'sharpe_ratio', 'max_drawdown_pct', 'total_return_pct']].mean().reset_index().to_csv(summary_file, index=False)
+
+
+def run_sensitivity_experiment():
     gamma_list = [0.9, 0.8, 0.7]
     batch_size_list = [16, 64, 256]
     replay_memory_size_list = [16, 64, 256]
@@ -567,9 +1037,7 @@ if __name__ == '__main__':
     batch_size_default = 16
     replay_memory_size_default = 32
 
-    pbar = tqdm(len(gamma_list) + len(replay_memory_size_list) + len(batch_size_list))
-
-    # test gamma
+    pbar = tqdm(total=(len(gamma_list) + len(replay_memory_size_list) + len(batch_size_list)))
 
     run = SensitivityRun(
         dataset_name,
@@ -594,7 +1062,6 @@ if __name__ == '__main__':
 
     run.save_experiment()
 
-    # test batch-size
     run = SensitivityRun(
         dataset_name,
         gamma_default,
@@ -618,7 +1085,6 @@ if __name__ == '__main__':
 
     run.save_experiment()
 
-    # test replay memory size
     run = SensitivityRun(
         dataset_name,
         gamma_default,
@@ -642,3 +1108,10 @@ if __name__ == '__main__':
 
     run.save_experiment()
     pbar.close()
+
+
+if __name__ == '__main__':
+    if args.market == 'single' and not args.symbols.strip():
+        run_sensitivity_experiment()
+    else:
+        run_market_experiment()

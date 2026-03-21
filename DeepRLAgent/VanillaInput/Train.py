@@ -55,12 +55,12 @@ class Train(BaseTrain):
                                     TARGET_UPDATE,
                                     n_step)
 
-        self.policy_net = DQN(data_train.state_size, 3).to(device)
-        self.target_net = DQN(data_train.state_size, 3).to(device)
+        self.policy_net = DQN(data_train.state_size, 3).to(self.device)
+        self.target_net = DQN(data_train.state_size, 3).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters())
 
         self.test_net = DQN(self.data_train.state_size, 3)
-        self.test_net.to(device)
+        self.test_net.to(self.device)
